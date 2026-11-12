@@ -1,0 +1,197 @@
+name: Compilar Pixora (Android)
+
+# Se inicia a mano: pestaña Actions > "Compilar Pixora (Android)" > Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      tipo:
+        description: "Qué compilar"
+        type: choice
+        default: apk-debug
+        options:
+          - apk-debug      # APK instalable de prueba (no necesita claves)
+          - aab-release    # AAB firmado para Google Play (necesita los 4 secretos de firma)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compilar (${{ inputs.tipo }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 1. Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: 1b. Preparar el proyecto (descomprime el ZIP si el repositorio solo contiene el ZIP)
+        run: |
+          if [ -f package.json ] && [ -d www ]; then
+            echo "El repositorio ya contiene el proyecto descomprimido."
+          else
+            ZIP=$(ls -t ./*.zip 2>/dev/null | head -n 1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "::error::No encuentro el proyecto. Sube el ZIP de Pixora a la raíz del repositorio (ver README_ANDROID.md, sección 1)."
+              exit 1
+            fi
+            echo "Descomprimiendo $ZIP"
+            rm -rf "$RUNNER_TEMP/proyecto" && mkdir -p "$RUNNER_TEMP/proyecto"
+            unzip -q "$ZIP" -d "$RUNNER_TEMP/proyecto"
+            SRC="$RUNNER_TEMP/proyecto"
+            if [ ! -f "$SRC/package.json" ]; then
+              FOUND=$(find "$RUNNER_TEMP/proyecto" -maxdepth 3 -name package.json -not -path '*/node_modules/*' | head -n 1)
+              [ -n "$FOUND" ] && SRC=$(dirname "$FOUND")
+            fi
+            if [ ! -f "$SRC/package.json" ]; then
+              echo "::error::El ZIP no contiene package.json. ¿Subiste el ZIP correcto?"
+              exit 1
+            fi
+            cp -a "$SRC"/. .
+          fi
+          ls -la
+
+      - name: 2. Instalar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 3. Instalar dependencias (Capacitor y plugins)
+        run: npm install --no-audit --no-fund
+
+      - name: 4. Descargar fuentes para uso sin conexión
+        # Si falla, la compilación continúa y la app cargará las fuentes desde Internet.
+        continue-on-error: true
+        run: node scripts/fetch-fonts.mjs
+
+      - name: 5. Generar el proyecto Android de Capacitor (si no existe)
+        run: |
+          if [ ! -d android ]; then
+            npx cap add android
+          else
+            echo "La carpeta android/ ya existe en el repositorio; se reutiliza."
+          fi
+
+      - name: 6. Aplicar ajustes de Pixora (icono, vertical, teclado, versión)
+        run: node scripts/patch-android.mjs
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+      - name: 7. Sincronizar archivos web con Android
+        run: npx cap sync android
+
+      - name: 8. Configurar Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 9. Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 9b. Instalar plataforma y build-tools de Android
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+
+      - name: 10. Configurar Gradle (con caché)
+        uses: gradle/actions/setup-gradle@v4
+
+      # ---------------------------------------------------------------
+      # APK de depuración
+      # ---------------------------------------------------------------
+      - name: 11a. Usar la clave de depuración fija de Pixora
+        if: ${{ inputs.tipo == 'apk-debug' }}
+        # Así todos los APK de prueba llevan la misma firma y se pueden instalar
+        # unos sobre otros SIN desinstalar (y sin perder los dibujos guardados).
+        run: |
+          mkdir -p ~/.android
+          cp resources/pixora-debug.keystore ~/.android/debug.keystore
+
+      - name: 11b. Compilar APK de depuración con Gradle
+        if: ${{ inputs.tipo == 'apk-debug' }}
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 11c. Preparar y comprobar el APK
+        if: ${{ inputs.tipo == 'apk-debug' }}
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          test -f "$APK" || { echo "No se generó $APK"; exit 1; }
+          mkdir -p salida
+          cp "$APK" salida/Pixora-debug.apk
+          echo "Contenido web dentro del APK:"
+          unzip -l salida/Pixora-debug.apk | grep -E "assets/public/(index.html|native-bridge.js)" || { echo "Faltan archivos web en el APK"; exit 1; }
+          SIZE=$(du -h salida/Pixora-debug.apk | cut -f1)
+          echo "### APK de depuración listo" >> "$GITHUB_STEP_SUMMARY"
+          echo "Archivo: \`Pixora-debug.apk\` ($SIZE). Descárgalo en la sección **Artifacts** al final de esta página." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 12a. Publicar el APK como artefacto
+        if: ${{ inputs.tipo == 'apk-debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixora-debug-apk
+          path: salida/Pixora-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---------------------------------------------------------------
+      # AAB de publicación (opcional, para el futuro)
+      # ---------------------------------------------------------------
+      - name: 13a. Comprobar que existen los secretos de firma
+        if: ${{ inputs.tipo == 'aab-release' }}
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KSP: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KA: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KP: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for v in KS KSP KA KP; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Falta un secreto de firma. Crea ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS y ANDROID_KEY_PASSWORD (ver README_ANDROID.md, sección 7)."
+              exit 1
+            fi
+          done
+
+      - name: 13b. Compilar AAB de publicación con Gradle
+        if: ${{ inputs.tipo == 'aab-release' }}
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew bundleRelease --no-daemon --stacktrace
+
+      - name: 13c. Firmar el AAB con tu clave
+        if: ${{ inputs.tipo == 'aab-release' }}
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KSP: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KA: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KP: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          AAB=android/app/build/outputs/bundle/release/app-release.aab
+          test -f "$AAB" || { echo "No se generó $AAB"; exit 1; }
+          echo "$KS" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          mkdir -p salida
+          cp "$AAB" salida/Pixora-release.aab
+          jarsigner -keystore "$RUNNER_TEMP/release.jks" \
+            -storepass "$KSP" -keypass "$KP" \
+            -sigalg SHA256withRSA -digestalg SHA-256 \
+            salida/Pixora-release.aab "$KA"
+          jarsigner -verify salida/Pixora-release.aab
+          rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: 14. Publicar el AAB como artefacto
+        if: ${{ inputs.tipo == 'aab-release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixora-release-aab
+          path: salida/Pixora-release.aab
+          if-no-files-found: error
+          retention-days: 30
+          
