@@ -90,13 +90,16 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: 9. Configurar Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 9b. Instalar plataforma y build-tools de Android
+      - name: 9. Configurar Android SDK (usa el SDK ya instalado en el runner)
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+          # El runner ya trae el Android SDK. Evitamos android-actions/setup-android,
+          # que falla al aceptar licencias con el sdkmanager preinstalado.
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM=$(command -v sdkmanager)
+          # 'yes' recibe SIGPIPE al terminar sdkmanager; por eso el "|| true"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "platforms;android-36" "build-tools;36.0.0"
 
       - name: 10. Configurar Gradle (con caché)
         uses: gradle/actions/setup-gradle@v4
