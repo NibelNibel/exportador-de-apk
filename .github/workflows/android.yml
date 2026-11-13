@@ -34,24 +34,28 @@ jobs:
           if [ -f package.json ] && [ -d www ]; then
             echo "El repositorio ya contiene el proyecto descomprimido."
           else
-            ZIP=$(ls -t ./*.zip 2>/dev/null | head -n 1 || true)
+            echo "ZIP encontrados en la raíz:"
+            ls -la ./*.zip 2>/dev/null || true
+            ZIP=""
+            while IFS= read -r Z; do
+              if unzip -Z1 "$Z" 2>/dev/null | grep -v node_modules | grep -E '(^|/)package\.json$' > /dev/null; then
+                ZIP="$Z"
+                break
+              fi
+              echo "Se omite $Z: no contiene package.json"
+            done < <(ls -t ./*.zip 2>/dev/null)
             if [ -z "$ZIP" ]; then
-              echo "::error::No encuentro el proyecto. Sube el ZIP de Pixora a la raíz del repositorio (ver README_ANDROID.md, sección 1)."
+              echo "::error::Ningún ZIP de la raíz contiene package.json. Sube el ZIP de Pixora a la raíz del repositorio (ver README_ANDROID.md, sección 1)."
               exit 1
             fi
             echo "Descomprimiendo $ZIP"
             rm -rf "$RUNNER_TEMP/proyecto" && mkdir -p "$RUNNER_TEMP/proyecto"
             unzip -q "$ZIP" -d "$RUNNER_TEMP/proyecto"
-            SRC="$RUNNER_TEMP/proyecto"
-            if [ ! -f "$SRC/package.json" ]; then
-              FOUND=$(find "$RUNNER_TEMP/proyecto" -maxdepth 3 -name package.json -not -path '*/node_modules/*' | head -n 1)
-              [ -n "$FOUND" ] && SRC=$(dirname "$FOUND")
-            fi
-            if [ ! -f "$SRC/package.json" ]; then
-              echo "::error::El ZIP no contiene package.json. ¿Subiste el ZIP correcto?"
-              exit 1
-            fi
-            cp -a "$SRC"/. .
+            # El ZIP trae todos los archivos sin permisos; se los damos para poder leerlos
+            chmod -R u+rwX "$RUNNER_TEMP/proyecto"
+            FOUND=$(find "$RUNNER_TEMP/proyecto" -maxdepth 4 -name package.json -not -path '*/node_modules/*' -print -quit)
+            SRC=$(dirname "$FOUND")
+            cp -R "$SRC"/. .
           fi
           ls -la
 
